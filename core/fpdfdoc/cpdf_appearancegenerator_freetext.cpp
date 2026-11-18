@@ -66,9 +66,10 @@ using appearance_generator::GenerateEphemeralDefaultAcroFormDict;
 using appearance_generator::GenerateExtGStateDict;
 using appearance_generator::GenerateResourcesDict;
 using appearance_generator::GenerateSquareAP;
-using appearance_generator::GetBorderStyleInfo;
+using appearance_generator::GetAnnotBorderStyleInfo;
 using appearance_generator::GetBorderWidth;
 using appearance_generator::GetColorStringWithDefault;
+using appearance_generator::GetDashPatternString;
 using appearance_generator::GetDefaultAppearanceInfo;
 using appearance_generator::GetFontFromDrFontDictOrGenerateFallback;
 using appearance_generator::GetPaintOperatorString;
@@ -144,6 +145,10 @@ CalloutEnvelope AppendCalloutEnvelope(fxcrt::ostringstream& appearance_stream,
   if (border_w > 0) {
     appearance_stream << border_w << " w\n";
   }
+  // The border's dash (/BS, or else /Border) draws the leader, its ending and
+  // the box alike, as a line annotation's dash draws its line and endings.
+  const ByteString dash = GetDashPatternString(annot_dict);
+  appearance_stream << dash;
 
   // (e) Draw callout polyline.
   // Extend conn along the incoming segment direction by half the border
@@ -236,6 +241,9 @@ CalloutEnvelope AppendCalloutEnvelope(fxcrt::ostringstream& appearance_stream,
   text_box_stroke.Deflate(half_bw, half_bw);
   WriteRect(appearance_stream, text_box_stroke)
       << " re " << GetPaintOperatorString(is_stroke_rect, is_fill_rect) << "\n";
+  if (!dash.IsEmpty()) {
+    appearance_stream << "[] 0 d\n";  // the text's underlines draw solid
+  }
   return {text_box, border_w, box_rot};
 }
 
@@ -414,7 +422,7 @@ PrepareRichFreeTextAPInternal(CPDF_Document* doc,
         inline_rotation ? envelope.box_rot.matrix.TransformRect(box) : box;
   } else {
     const BorderStyleInfo border_style_info =
-        GetBorderStyleInfo(annot_dict->GetDictFor("BS"));
+        GetAnnotBorderStyleInfo(annot_dict);
     const ShapeRotationInfo rot_info = GetShapeRotationInfo(annot_dict);
     const CFX_FloatRect rect = rot_info.bbox;
     const float half_border_width = border_style_info.width / 2.0f;
