@@ -42,6 +42,7 @@
 #include "core/fpdfapi/parser/cpdf_stream_acc.h"
 #include "core/fpdfapi/parser/cpdf_string.h"
 #include "core/fpdfdoc/cpdf_annot.h"
+#include "core/fpdfdoc/cpdf_annot_border.h"
 #include "core/fpdfdoc/cpdf_annot_rotation.h"
 #include "core/fpdfdoc/cpdf_appearancegenerator.h"
 #include "core/fpdfdoc/cpdf_color_utils.h"
@@ -313,20 +314,6 @@ static_assert(static_cast<int>(CPDF_Annot::ReplyType::kReply) ==
 static_assert(static_cast<int>(CPDF_Annot::ReplyType::kGroup) ==
                   FPDF_ANNOT_RT_GROUP,
               "ReplyType::kGroup mismatch");
-
-class RawAnnotContext final : public CPDF_AnnotContext {
- public:
-  // Takes ownership of |unparsed_page| by value (RetainPtr).
-  RawAnnotContext(RetainPtr<CPDF_Dictionary> dict,
-                  RetainPtr<CPDF_Page> unparsed_page,
-                  int annot_index)
-      : CPDF_AnnotContext(dict, unparsed_page.Get(), annot_index),
-        owned_page_(std::move(unparsed_page)) {}
-
- private:
-  // Keeps the page alive as long as the annot context lives.
-  const RetainPtr<CPDF_Page> owned_page_;
-};
 
 // Checks if an annotation subtype can have a /Name entry.
 bool IsNameSubtype(FPDF_ANNOTATION_SUBTYPE subtype) {
@@ -1398,21 +1385,203 @@ EPDFAnnot_ClearRectangleDifferences(FPDF_ANNOTATION annot) {
 
 namespace {
 
-RetainPtr<const CPDF_Array> GetExplicitBorderDashArray(
-    const CPDF_Dictionary* pAnnotDict) {
-  RetainPtr<const CPDF_Dictionary> pBSDict = pAnnotDict->GetDictFor("BS");
-  if (pBSDict) {
-    // /BS takes precedence over /Border. Its /D is the pattern as stored,
-    // whatever /S says: only a dashed border draws it.
-    return pBSDict->GetArrayFor("D");
+// Gives |annot_dict| a dictionary of its own under |key| when the entry
+// names an indirect object: a copy with the same entries. Another annotation
+// may name that object too, and a change to it would show there as well.
+void OwnDictEntry(FPDF_ANNOTATION annot,
+                  CPDF_Dictionary* annot_dict,
+                  ByteStringView key) {
+  RetainPtr<const CPDF_Object> entry = annot_dict->GetObjectFor(key);
+  if (!entry || !entry->IsReference()) {
+    return;
+  }
+  RetainPtr<const CPDF_Dictionary> shared = annot_dict->GetDictFor(key);
+  if (!shared) {
+    return;
+  }
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+  CPDF_Document* doc = context && context->GetPage()
+                           ? context->GetPage()->GetDocument()
+                           : nullptr;
+  annot_dict->SetFor(ByteString(key),
+                     doc ? shared->CloneForHolder(doc) : shared->Clone());
+}
+
+// The entries of |array| when every one is a number.
+std::optional<std::vector<float>> NumbersOf(const CPDF_Array* array) {
+  std::vector<float> numbers;
+  for (size_t i = 0; i < array->size(); ++i) {
+    RetainPtr<const CPDF_Object> entry = array->GetDirectObjectAt(i);
+    if (!entry || !entry->IsNumber()) {
+      return std::nullopt;
+    }
+    numbers.push_back(entry->GetNumber());
+  }
+  return numbers;
+}
+
+// What the key an annotation's border is read from states, for a setter to
+// see whether a call would change anything.
+//
+// A /BS states what its entries say, and an entry it leaves out is not
+// stated. A /Border has no entry to leave out: its form states all three,
+// the width as its third number, and dashed with the pattern its dash array
+// holds or solid without one.
+struct StatedBorder {
+  // False for a border kept in /Border.
+  bool in_border_style = true;
+  std::optional<float> width;
+  // The style's name: /BS /S, or S or D for a /Border.
+  std::optional<ByteString> style;
+  // /BS /D, or the pattern of a /Border that has one.
+  std::optional<std::vector<float>> pattern;
+};
+
+// What |annot_dict|'s border states, by the rule fpdfdoc::ReadAnnotBorder
+// reads it with: /BS, or else /Border, or else nothing. Nothing is returned
+// when that key is not written as ISO 32000 writes a border: a /BS that is
+// no dictionary, a name where a number goes, a /Border that is not three
+// numbers and at most a dash array, an entry that names an object the file
+// does not have. Such a border may read as what a call asks for (a name
+// reads as 0) without stating it, so a setter writes it anew.
+//
+// An entry is looked for by its key: one that is there and names nothing is
+// not one that is left out.
+std::optional<StatedBorder> ReadStatedBorder(
+    const CPDF_Dictionary* annot_dict) {
+  StatedBorder stated;
+  if (annot_dict->KeyExist("BS")) {
+    RetainPtr<const CPDF_Dictionary> border_style =
+        annot_dict->GetDictFor("BS");
+    if (!border_style) {
+      return std::nullopt;
+    }
+    if (border_style->KeyExist("W")) {
+      RetainPtr<const CPDF_Object> width =
+          border_style->GetDirectObjectFor("W");
+      if (!width || !width->IsNumber()) {
+        return std::nullopt;
+      }
+      stated.width = width->GetNumber();
+    }
+    if (border_style->KeyExist("S")) {
+      RetainPtr<const CPDF_Object> style =
+          border_style->GetDirectObjectFor("S");
+      if (!style || !style->IsName()) {
+        return std::nullopt;
+      }
+      stated.style = style->GetString();
+    }
+    if (border_style->KeyExist("D")) {
+      RetainPtr<const CPDF_Array> dash = border_style->GetArrayFor("D");
+      if (!dash) {
+        return std::nullopt;
+      }
+      stated.pattern = NumbersOf(dash.Get());
+      if (!stated.pattern.has_value()) {
+        return std::nullopt;
+      }
+    }
+    return stated;
   }
 
-  RetainPtr<const CPDF_Array> pBorderArray =
-      pAnnotDict->GetArrayFor(pdfium::annotation::kBorder);
-  if (!pBorderArray || pBorderArray->size() < 4) {
-    return nullptr;
+  if (!annot_dict->KeyExist(pdfium::annotation::kBorder)) {
+    return stated;
   }
-  return pBorderArray->GetArrayAt(3);
+  RetainPtr<const CPDF_Array> border =
+      annot_dict->GetArrayFor(pdfium::annotation::kBorder);
+  if (!border || border->size() < 3 || border->size() > 4) {
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < 3; ++i) {
+    RetainPtr<const CPDF_Object> number = border->GetDirectObjectAt(i);
+    if (!number || !number->IsNumber()) {
+      return std::nullopt;
+    }
+  }
+  stated.in_border_style = false;
+  stated.width = border->GetFloatAt(2);
+  stated.style = "S";
+  if (border->size() == 4) {
+    RetainPtr<const CPDF_Object> dash = border->GetDirectObjectAt(3);
+    if (!dash || !dash->IsArray()) {
+      return std::nullopt;
+    }
+    std::optional<std::vector<float>> pattern = NumbersOf(dash->AsArray());
+    if (!pattern.has_value()) {
+      return std::nullopt;
+    }
+    // An empty dash array is a solid line, and no pattern.
+    if (!pattern->empty()) {
+      stated.style = "D";
+      stated.pattern = std::move(pattern);
+    }
+  }
+  return stated;
+}
+
+// Whether |stated| already is the style and width a call asks for: the name
+// |style_name|, or no /S when it is empty; |width|, or no /W when it is
+// negative. In a /Border, which leaves nothing out, no /S is solid and no /W
+// is 1 wide.
+bool StatesStyleAndWidth(const StatedBorder& stated,
+                         const ByteString& style_name,
+                         float width) {
+  if (!stated.in_border_style) {
+    return stated.style ==
+               (style_name.IsEmpty() ? ByteString("S") : style_name) &&
+           stated.width == (width >= 0 ? width : 1.0f);
+  }
+  const bool states_style = style_name.IsEmpty() ? !stated.style.has_value()
+                                                 : stated.style == style_name;
+  const bool states_width =
+      width >= 0 ? stated.width == width : !stated.width.has_value();
+  return states_style && states_width;
+}
+
+// Whether |stated| already has the dash pattern |pattern|, or none when it
+// is empty.
+bool StatesPattern(const StatedBorder& stated,
+                   const std::vector<float>& pattern) {
+  return pattern.empty() ? !stated.pattern.has_value()
+                         : stated.pattern == pattern;
+}
+
+// The /BS a border setter writes into: a dictionary of the annotation's own
+// (OwnDictEntry()), since a /BS that is an indirect object may be another
+// annotation's too.
+//
+// An annotation that keeps its border in /Border alone is given that border
+// as a /BS first: its width, and a dashed style with its pattern when the
+// array has one. The setter then changes the part it sets, and the rest
+// stays as it read. /Border is removed: with a /BS beside it a reader that
+// follows ISO 32000-1 12.5.2 no longer looks at it, and one that reads
+// /Border first (PDFium's form filler does) would go on showing the old
+// border. Its corner radii go with it, which a /BS cannot hold, so a setter
+// comes here only for a call that changes the border.
+RetainPtr<CPDF_Dictionary> BorderStyleDictForWrite(
+    FPDF_ANNOTATION annot,
+    CPDF_Dictionary* annot_dict) {
+  OwnDictEntry(annot, annot_dict, "BS");
+  RetainPtr<CPDF_Dictionary> bs_dict = annot_dict->GetMutableDictFor("BS");
+  if (!bs_dict) {
+    const bool has_border_array =
+        !!annot_dict->GetArrayFor(pdfium::annotation::kBorder);
+    const fpdfdoc::AnnotBorder border = fpdfdoc::ReadAnnotBorder(annot_dict);
+    bs_dict = annot_dict->SetNewFor<CPDF_Dictionary>("BS");
+    if (has_border_array) {
+      bs_dict->SetNewFor<CPDF_Number>("W", border.width);
+      if (border.style == CPDF_Annot::BorderStyle::kDashed) {
+        bs_dict->SetNewFor<CPDF_Name>("S", "D");
+        RetainPtr<CPDF_Array> dash = bs_dict->SetNewFor<CPDF_Array>("D");
+        for (size_t i = 0; i < border.dash_array->size(); ++i) {
+          dash->AppendNew<CPDF_Number>(border.dash_array->GetFloatAt(i));
+        }
+      }
+    }
+  }
+  annot_dict->RemoveFor(pdfium::annotation::kBorder);
+  return bs_dict;
 }
 
 }  // namespace
@@ -1426,7 +1595,7 @@ EPDFAnnot_GetBorderDashPatternCount(FPDF_ANNOTATION annot) {
   }
 
   RetainPtr<const CPDF_Array> pDashArray =
-      GetExplicitBorderDashArray(pAnnotDict);
+      fpdfdoc::ReadAnnotBorder(pAnnotDict).dash_array;
   return pDashArray ? pDashArray->size() : 0;
 }
 
@@ -1441,7 +1610,7 @@ EPDFAnnot_GetBorderDashPattern(FPDF_ANNOTATION annot,
   }
 
   RetainPtr<const CPDF_Array> pDashArray =
-      GetExplicitBorderDashArray(pAnnotDict);
+      fpdfdoc::ReadAnnotBorder(pAnnotDict).dash_array;
   if (!pDashArray || pDashArray->size() < count) {
     return false;
   }
@@ -1458,8 +1627,24 @@ EPDFAnnot_SetBorderDashPattern(FPDF_ANNOTATION annot,
                                const float* dash_array,
                                unsigned long count) {
   ScopedFPDFAnnotationView annot_view(annot);
-  if (!annot) {
+  const CPDF_Dictionary* stored_dict = GetAnnotDictFromFPDFAnnotation(annot);
+  if (!stored_dict) {
     return false;
+  }
+
+  // The pattern asked for; none removes it.
+  std::vector<float> pattern;
+  if (dash_array) {
+    // SAFETY: caller guarantees `dash_array` has `count` elements.
+    for (unsigned long i = 0; i < count; ++i) {
+      pattern.push_back(dash_array[i]);
+    }
+  }
+
+  // Nothing to change: no write, and a /Border stays a /Border.
+  const std::optional<StatedBorder> stated = ReadStatedBorder(stored_dict);
+  if (stated.has_value() && StatesPattern(stated.value(), pattern)) {
+    return true;
   }
 
   RetainPtr<CPDF_Dictionary> annot_dict =
@@ -1467,37 +1652,25 @@ EPDFAnnot_SetBorderDashPattern(FPDF_ANNOTATION annot,
   if (!annot_dict) {
     return false;
   }
+  RetainPtr<CPDF_Dictionary> bs_dict =
+      BorderStyleDictForWrite(annot, annot_dict.Get());
 
-  RetainPtr<CPDF_Dictionary> bs_dict = annot_dict->GetMutableDictFor("BS");
-  if (!bs_dict) {
-    bs_dict = annot_dict->SetNewFor<CPDF_Dictionary>("BS");
-  }
-
-  // --- Removal branch (PDFium style) ---
-  if (!dash_array || count == 0) {
+  // The pattern only: /S stays as it is, so a solid border with a pattern
+  // still draws solid, and a dashed one without draws the default dash.
+  if (pattern.empty()) {
     bs_dict->RemoveFor("D");
-    // Optional: if style was dashed only because of the array, you can revert.
-    // Leaving it unchanged matches PDFium's permissive style.
     if (bs_dict->size() == 0) {
       annot_dict->RemoveFor("BS");
     }
     return true;
   }
 
-  // --- Set branch --- (the pattern only: /S stays as it is, so a solid
-  // border with a pattern still draws solid)
-  RetainPtr<CPDF_Array> d_array = bs_dict->GetMutableArrayFor("D");
-  if (d_array) {
-    d_array->Clear();
-  } else {
-    d_array = bs_dict->SetNewFor<CPDF_Array>("D");
+  // A new array under the key. The one the entry named is not written into:
+  // it may be an object of its own, which another /BS names too.
+  RetainPtr<CPDF_Array> d_array = bs_dict->SetNewFor<CPDF_Array>("D");
+  for (float value : pattern) {
+    d_array->AppendNew<CPDF_Number>(value);
   }
-
-  // SAFETY: caller guarantees `dash_array` has `count` elements.
-  for (unsigned long i = 0; i < count; ++i) {
-    d_array->AppendNew<CPDF_Number>(dash_array[i]);
-  }
-
   return true;
 }
 
@@ -1512,41 +1685,13 @@ EPDFAnnot_GetBorderStyle(FPDF_ANNOTATION annot, float* width) {
     return FPDF_ANNOT_BS_UNKNOWN;
   }
 
-  RetainPtr<const CPDF_Dictionary> pBSDict = pAnnotDict->GetDictFor("BS");
-  if (pBSDict) {
-    if (width) {
-      *width = pBSDict->KeyExist("W") ? pBSDict->GetFloatFor("W") : 1.0f;
-    }
-
-    CPDF_Annot::BorderStyle nStyle =
-        CPDF_Annot::StringToBorderStyle(pBSDict->GetNameFor("S"));
-    if (nStyle == CPDF_Annot::BorderStyle::kUnknown) {
-      nStyle = CPDF_Annot::BorderStyle::kSolid;
-    }
-    // A dashed border with an empty pattern draws a solid line (ISO 32000
-    // 8.4.3.6), so it reads solid, as a /Border with an empty dash array does.
-    RetainPtr<const CPDF_Array> pDashArray = pBSDict->GetArrayFor("D");
-    if (nStyle == CPDF_Annot::BorderStyle::kDashed && pDashArray &&
-        pDashArray->IsEmpty()) {
-      nStyle = CPDF_Annot::BorderStyle::kSolid;
-    }
-    return static_cast<FPDF_ANNOT_BORDER_STYLE>(nStyle);
-  }
-
-  RetainPtr<const CPDF_Array> pBorderArray =
-      pAnnotDict->GetArrayFor(pdfium::annotation::kBorder);
+  // The one reading of a border, which the appearance generator draws from:
+  // /BS, or else /Border, or else solid and 1 wide.
+  const fpdfdoc::AnnotBorder border = fpdfdoc::ReadAnnotBorder(pAnnotDict);
   if (width) {
-    *width = pBorderArray && pBorderArray->size() >= 3
-                 ? pBorderArray->GetFloatAt(2)
-                 : 1.0f;
+    *width = border.width;
   }
-
-  RetainPtr<const CPDF_Array> pDashArray =
-      GetExplicitBorderDashArray(pAnnotDict);
-  if (pDashArray && !pDashArray->IsEmpty()) {
-    return FPDF_ANNOT_BS_DASHED;
-  }
-  return FPDF_ANNOT_BS_SOLID;
+  return static_cast<FPDF_ANNOT_BORDER_STYLE>(border.style);
 }
 
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
@@ -1554,36 +1699,46 @@ EPDFAnnot_SetBorderStyle(FPDF_ANNOTATION annot,
                          FPDF_ANNOT_BORDER_STYLE style,
                          float width) {
   ScopedFPDFAnnotationView annot_view(annot);
+  const CPDF_Dictionary* stored_dict = GetAnnotDictFromFPDFAnnotation(annot);
+  if (!stored_dict) {
+    return false;
+  }
+
+  // A style that is none of ours is refused before the annotation is taken
+  // for writing.
+  ByteString style_name;
+  if (style != FPDF_ANNOT_BS_UNKNOWN) {
+    style_name = CPDF_Annot::BorderStyleToString(
+        static_cast<CPDF_Annot::BorderStyle>(style));
+    if (style_name.IsEmpty()) {
+      return false;
+    }
+  }
+
+  // Nothing to change: no write, and a /Border stays a /Border.
+  const std::optional<StatedBorder> stated = ReadStatedBorder(stored_dict);
+  if (stated.has_value() &&
+      StatesStyleAndWidth(stated.value(), style_name, width)) {
+    return true;
+  }
+
   RetainPtr<CPDF_Dictionary> pAnnotDict =
       GetMutableAnnotDictFromFPDFAnnotation(annot);
   if (!pAnnotDict) {
     return false;
   }
-
-  RetainPtr<CPDF_Dictionary> pBSDict = pAnnotDict->GetMutableDictFor("BS");
-  if (!pBSDict) {
-    pBSDict = pAnnotDict->SetNewFor<CPDF_Dictionary>("BS");
-  }
-
+  RetainPtr<CPDF_Dictionary> pBSDict =
+      BorderStyleDictForWrite(annot, pAnnotDict.Get());
   if (width >= 0) {
     pBSDict->SetNewFor<CPDF_Number>("W", width);
   } else {
     pBSDict->RemoveFor("W");
   }
-
-  if (style == FPDF_ANNOT_BS_UNKNOWN) {
-    pBSDict->RemoveFor("S");
-    return true;
-  }
-
-  auto internal_style = static_cast<CPDF_Annot::BorderStyle>(style);
-  ByteString style_name = CPDF_Annot::BorderStyleToString(internal_style);
-
   if (style_name.IsEmpty()) {
-    return false;
+    pBSDict->RemoveFor("S");
+  } else {
+    pBSDict->SetNewFor<CPDF_Name>("S", style_name);
   }
-
-  pBSDict->SetNewFor<CPDF_Name>("S", style_name);
   return true;
 }
 
@@ -2821,16 +2976,13 @@ EPDFPage_GetAnnotRaw(FPDF_DOCUMENT doc, int page_index, int index) {
     return nullptr;
   }
 
-  // Use the standard MakeRetain to create the page object.
-  // This works because of the CONSTRUCT_VIA_MAKE_RETAIN macro in cpdf_page.h.
+  // Built from the dictionary alone: its content is never parsed. The handle
+  // keeps the page, and closing the handle frees it.
   auto page = pdfium::MakeRetain<CPDF_Page>(pdf, page_dict);
-
-  // Create the context, which now takes the RetainPtr directly.
-  auto ctx = std::make_unique<RawAnnotContext>(std::move(annot_dict),
-                                               std::move(page), index);
-
-  // The lifetime is now perfectly managed by smart pointers.
-  return FPDFAnnotationFromCPDFAnnotContext(ctx.release());
+  return FPDFAnnotationFromCPDFAnnotContext(
+      CPDF_AnnotContext::CreateOwningPage(std::move(annot_dict),
+                                          std::move(page), index)
+          .release());
 }
 
 FPDF_EXPORT FPDF_ANNOTATION FPDF_CALLCONV
@@ -2855,7 +3007,8 @@ EPDFPage_CreateAnnotRaw(FPDF_DOCUMENT doc,
   if (!CPDF_Document::IsPageTreeLeaf(page_dict.Get())) {
     return nullptr;
   }
-  // Built from the dictionary alone: its content is never parsed.
+  // Built from the dictionary alone: its content is never parsed. The handle
+  // keeps the page, and closing the handle frees it.
   auto page = pdfium::MakeRetain<CPDF_Page>(pdf, page_dict);
 
   RetainPtr<CPDF_Dictionary> dict =
@@ -2876,9 +3029,10 @@ EPDFPage_CreateAnnotRaw(FPDF_DOCUMENT doc,
   annots->AppendNew<CPDF_Reference>(pdf, dict->GetObjNum());
   const int index = fxcrt::CollectionSize<int>(*annots) - 1;
 
-  auto ctx =
-      std::make_unique<RawAnnotContext>(std::move(dict), std::move(page), index);
-  return FPDFAnnotationFromCPDFAnnotContext(ctx.release());
+  return FPDFAnnotationFromCPDFAnnotContext(
+      CPDF_AnnotContext::CreateOwningPage(std::move(dict), std::move(page),
+                                          index)
+          .release());
 }
 
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFPage_RemoveAnnotRaw(FPDF_DOCUMENT doc,
@@ -2987,22 +3141,31 @@ EPDFAnnot_GetName(FPDF_ANNOTATION annot, char* buffer, unsigned long buflen) {
       name_str, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
 }
 
-// Where a stamp's drawing is placed: its unrotated box and the rotation, when
-// /EMBD_Metadata records both, else /Rect.
+// Where a drawing is placed: the box it is fitted into, before any turn, and
+// the turn about that box's middle. A stamp's are the ones /EMBD_Metadata
+// records, else /Rect unturned, and /Rect is written to stand around them. A
+// widget's follow from /Rect and /MK /R, the entries every PDF app reads, so
+// placing a drawing in a widget never writes /Rect.
 struct PlacementBox {
   CFX_FloatRect rect;
   bool rotated = false;
   float degrees = 0;
+  bool writes_rect = true;
 };
 
 static PlacementBox ReadPlacementBox(const CPDF_Dictionary* annot_dict) {
-  const std::optional<fpdfdoc::AnnotRotation> recorded =
-      fpdfdoc::GetRecordedAnnotRotation(annot_dict);
+  const bool widget =
+      CPDF_Annot::StringToAnnotSubtype(annot_dict->GetNameFor(
+          pdfium::annotation::kSubtype)) == CPDF_Annot::Subtype::WIDGET;
+  const std::optional<fpdfdoc::AnnotRotation> turn =
+      widget ? fpdfdoc::GetWidgetAnnotRotation(annot_dict)
+             : fpdfdoc::GetRecordedAnnotRotation(annot_dict);
   PlacementBox box;
-  box.rotated = recorded.has_value();
-  box.degrees = recorded ? recorded->degrees : 0;
-  box.rect = recorded ? recorded->box
-                      : annot_dict->GetRectFor(pdfium::annotation::kRect);
+  box.rotated = turn.has_value();
+  box.degrees = turn ? turn->degrees : 0;
+  box.rect =
+      turn ? turn->box : annot_dict->GetRectFor(pdfium::annotation::kRect);
+  box.writes_rect = !widget;
   return box;
 }
 
@@ -3076,10 +3239,7 @@ static bool PlaceWrapper(CPDF_AnnotContext* ctx,
   // too: /Rect places it on the page, and a form around the wrapper (our
   // opacity layer, or another editor's) then needs no matrix of its own.
   if (box.rotated) {
-    const float theta = box.degrees * 3.14159265358979323846f / 180.0f;
-    const float cos_t = cosf(theta);
-    const float sin_t = sinf(theta);
-    CFX_Matrix rotation(cos_t, sin_t, -sin_t, cos_t, 0, 0);
+    CFX_Matrix rotation = fpdfdoc::TurnAbout(CFX_PointF(), box.degrees);
     CFX_FloatRect turned =
         rotation.TransformRect(CFX_FloatRect(0, 0, box_w, box_h));
     turned.Normalize();
@@ -3087,13 +3247,15 @@ static bool PlaceWrapper(CPDF_AnnotContext* ctx,
     ap_dict->SetMatrixFor("Matrix", rotation);
     // /Rect is the upright box around the turned drawing, about the box's
     // middle: it places the appearance at scale 1, where any other would
-    // stretch it.
-    const CFX_PointF center = fpdfdoc::BoxCenter(box.rect);
-    ad->SetRectFor(pdfium::annotation::kRect,
-                   CFX_FloatRect(center.x - turned.Width() / 2,
-                                 center.y - turned.Height() / 2,
-                                 center.x + turned.Width() / 2,
-                                 center.y + turned.Height() / 2));
+    // stretch it. A widget's box came from its /Rect, which stays.
+    if (box.writes_rect) {
+      const CFX_PointF center = fpdfdoc::BoxCenter(box.rect);
+      ad->SetRectFor(pdfium::annotation::kRect,
+                     CFX_FloatRect(center.x - turned.Width() / 2,
+                                   center.y - turned.Height() / 2,
+                                   center.x + turned.Width() / 2,
+                                   center.y + turned.Height() / 2));
+    }
   } else {
     ap_dict->RemoveFor("Matrix");
   }
@@ -3177,9 +3339,10 @@ static bool RefitPlacedAppearance(FPDF_ANNOTATION annot,
   }
 
   // Otherwise the current appearance is the drawing to wrap. Turned by our
-  // keys, it is the form another app drew it in, without the matrices that
-  // turn and place that form (a stamp Acrobat turned): our wrapper places and
-  // turns it now, as it takes over the stretch onto /Rect.
+  // keys, or by a widget's /MK /R, it is the form another app drew it in,
+  // without the matrices that turn and place that form (a stamp Acrobat
+  // turned): our wrapper places and turns it now, as it takes over the
+  // stretch onto /Rect.
   if (content_rect.IsEmpty()) {
     if (box.rotated) {
       ap = ToStream(EpdfFindDrawnForm(ap.Get(), painted_opacity).form->Clone());
@@ -3734,12 +3897,17 @@ static RetainPtr<CPDF_Stream> NewDrawingWrapper(CPDF_Document* doc,
   return wrapper;
 }
 
-// The drawing our wrapper places on a stamp, or null: a stamp without our
-// wrapper, or not a stamp.
-static RetainPtr<const CPDF_Stream> StampDrawingOf(
+// The drawing our wrapper places on a stamp or in a widget (a signature
+// field's mark), or null: an appearance without our wrapper, or another kind
+// of annotation.
+static RetainPtr<const CPDF_Stream> PlacedDrawingOf(
     const CPDF_Dictionary* annot_dict) {
-  if (!annot_dict ||
-      annot_dict->GetNameFor(pdfium::annotation::kSubtype) != "Stamp") {
+  if (!annot_dict) {
+    return nullptr;
+  }
+  const ByteString subtype =
+      annot_dict->GetNameFor(pdfium::annotation::kSubtype);
+  if (subtype != "Stamp" && subtype != "Widget") {
     return nullptr;
   }
   RetainPtr<CPDF_Stream> ap =
@@ -4023,9 +4191,9 @@ EPDFDoc_ExportDrawing(FPDF_DOCUMENT document, unsigned int drawing) {
 }
 
 FPDF_EXPORT unsigned long FPDF_CALLCONV
-EPDFDoc_GetStampDrawings(FPDF_DOCUMENT document,
-                         unsigned int* buffer,
-                         unsigned long buflen) {
+EPDFDoc_GetDrawings(FPDF_DOCUMENT document,
+                    unsigned int* buffer,
+                    unsigned long buflen) {
   CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
   if (!doc) {
     return 0;
@@ -4034,6 +4202,12 @@ EPDFDoc_GetStampDrawings(FPDF_DOCUMENT document,
   CPDF_DocumentViewScope document_view(doc);
   std::vector<uint32_t> drawings;
   std::set<uint32_t> seen;
+  auto add = [&drawings, &seen](const CPDF_Stream* drawing) {
+    if (drawing && drawing->GetObjNum() != 0 &&
+        seen.insert(drawing->GetObjNum()).second) {
+      drawings.push_back(drawing->GetObjNum());
+    }
+  };
   for (int i = 0; i < doc->GetPageCount(); ++i) {
     RetainPtr<const CPDF_Dictionary> page = doc->GetPageDictionary(i);
     RetainPtr<const CPDF_Array> annots =
@@ -4043,9 +4217,22 @@ EPDFDoc_GetStampDrawings(FPDF_DOCUMENT document,
     }
     for (size_t j = 0; j < annots->size(); ++j) {
       RetainPtr<const CPDF_Dictionary> annot = annots->GetDictAt(j);
-      RetainPtr<const CPDF_Stream> drawing = StampDrawingOf(annot.Get());
-      if (drawing && seen.insert(drawing->GetObjNum()).second) {
-        drawings.push_back(drawing->GetObjNum());
+      // What a wrapper places: a stamp's artwork, a mark in a widget.
+      add(PlacedDrawingOf(annot.Get()).Get());
+      // What a widget's /MK names as an icon: a form, whoever made it.
+      RetainPtr<const CPDF_Dictionary> mk =
+          annot && annot->GetNameFor(pdfium::annotation::kSubtype) == "Widget"
+              ? annot->GetDictFor("MK")
+              : nullptr;
+      if (!mk) {
+        continue;
+      }
+      for (const char* key : {pdfium::appearance::kI, pdfium::appearance::kRI,
+                              pdfium::appearance::kIX}) {
+        RetainPtr<const CPDF_Stream> icon = mk->GetStreamFor(key);
+        if (icon && icon->GetDict()->GetNameFor("Subtype") == "Form") {
+          add(icon.Get());
+        }
       }
     }
   }
@@ -4059,40 +4246,47 @@ EPDFDoc_GetStampDrawings(FPDF_DOCUMENT document,
   return static_cast<unsigned long>(drawings.size());
 }
 
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDFAnnot_SetStampDrawing(FPDF_ANNOTATION annot,
-                          unsigned int drawing,
-                          EPDF_STAMP_FIT fit) {
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_SetDrawing(FPDF_ANNOTATION annot,
+                                                         unsigned int drawing,
+                                                         EPDF_STAMP_FIT fit) {
   ScopedFPDFAnnotationView annot_view(annot);
   CPDF_AnnotContext* ctx = CPDFAnnotContextFromFPDFAnnotation(annot);
-  if (!ctx || drawing == 0 || FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_STAMP) {
+  const FPDF_ANNOTATION_SUBTYPE subtype = FPDFAnnot_GetSubtype(annot);
+  if (!ctx || drawing == 0 ||
+      (subtype != FPDF_ANNOT_STAMP && subtype != FPDF_ANNOT_WIDGET)) {
+    return false;
+  }
+  CPDF_Document* doc = ctx->GetPage() ? ctx->GetPage()->GetDocument() : nullptr;
+  const CPDF_Dictionary* annot_dict = ctx->GetAnnotDict();
+  if (!doc || !annot_dict) {
+    return false;
+  }
+  // The drawing and the box are checked before the annotation is opened for
+  // writing: a refused call changes nothing, and on a layer copies nothing
+  // up. The drawing is only read, so it can be one an earlier revision holds.
+  RetainPtr<const CPDF_Stream> form =
+      ToStream(doc->GetOrParseIndirectObject(drawing));
+  if (!form || form->GetDict()->GetNameFor("Subtype") != "Form" ||
+      GetFormDisplayBox(form->GetDict().Get()).IsEmpty() ||
+      !HasArea(ReadPlacementBox(annot_dict))) {
     return false;
   }
   RetainPtr<CPDF_Dictionary> ad = ctx->GetMutableAnnotDict();
-  CPDF_Document* doc = ctx->GetPage() ? ctx->GetPage()->GetDocument() : nullptr;
-  if (!ad || !doc) {
-    return false;
-  }
-  RetainPtr<const CPDF_Stream> form =
-      ToStream(doc->GetOrParseIndirectObject(drawing));
-  if (!form || form->GetDict()->GetNameFor("Subtype") != "Form") {
+  RetainPtr<CPDF_Stream> wrapper = NewDrawingWrapper(doc, form.Get());
+  if (!ad || !wrapper) {
     return false;
   }
   const PlacementBox box = ReadPlacementBox(ad.Get());
-  RetainPtr<CPDF_Stream> wrapper = NewDrawingWrapper(doc, form.Get());
-  if (!HasArea(box) || !wrapper) {
-    return false;
-  }
   ad->GetOrCreateDictFor(pdfium::annotation::kAP);
   return PlaceWrapper(ctx, ad.Get(), doc, std::move(wrapper),
                       GetFormDisplayBox(form->GetDict().Get()), box, fit);
 }
 
 FPDF_EXPORT unsigned int FPDF_CALLCONV
-EPDFAnnot_GetStampDrawing(FPDF_ANNOTATION annot) {
+EPDFAnnot_GetDrawing(FPDF_ANNOTATION annot) {
   ScopedFPDFAnnotationView annot_view(annot);
   RetainPtr<const CPDF_Stream> drawing =
-      StampDrawingOf(GetAnnotDictFromFPDFAnnotation(annot));
+      PlacedDrawingOf(GetAnnotDictFromFPDFAnnotation(annot));
   return drawing ? drawing->GetObjNum() : 0;
 }
 
@@ -4360,6 +4554,36 @@ EPDFAnnot_GetDrawingRect(FPDF_ANNOTATION annot,
   return true;
 }
 
+namespace {
+
+// An annotation's /MK, to write an entry in: a dictionary of the
+// annotation's own. One that is an indirect object may be another widget's
+// too, and a change to it would show in that widget as well. So the
+// annotation gets a copy first, with the same entries. With |create|, one
+// that has no /MK gets an empty one; without, null.
+RetainPtr<CPDF_Dictionary> OwnMKForWriting(FPDF_ANNOTATION annot,
+                                           CPDF_Dictionary* annot_dict,
+                                           bool create) {
+  OwnDictEntry(annot, annot_dict, "MK");
+  return create ? annot_dict->GetOrCreateDictFor("MK")
+                : annot_dict->GetMutableDictFor("MK");
+}
+
+// The form a /MK names as its icon |key|, or null. An icon is a form XObject
+// that is an object of its own (ISO 32000-2 Table 192): an entry that names
+// anything else, an image say, is no icon. Nothing draws, lists or exports
+// it.
+RetainPtr<const CPDF_Stream> MKIconForm(const CPDF_Dictionary* mk,
+                                        const char* key) {
+  RetainPtr<const CPDF_Stream> icon = mk ? mk->GetStreamFor(key) : nullptr;
+  return icon && icon->GetObjNum() != 0 &&
+                 icon->GetDict()->GetNameFor("Subtype") == "Form"
+             ? icon
+             : nullptr;
+}
+
+}  // namespace
+
 static ByteString GetMKColorKey(EPDF_MK_COLORTYPE type) {
   switch (type) {
     case EPDF_MK_COLOR_BG:
@@ -4370,28 +4594,65 @@ static ByteString GetMKColorKey(EPDF_MK_COLORTYPE type) {
   return "BC";
 }
 
+// A component of a /MK colour as the API reads it, 0 to 255.
+static unsigned int MKColorComponent(const CPDF_Array* color, size_t index) {
+  return static_cast<unsigned int>(color->GetFloatAt(index) * 255.f + 0.5f);
+}
+
+// Whether |color| is the RGB colour |r| |g| |b| as a /MK stores one: three
+// numbers from 0 to 1 that read as it. An entry that only reads as the
+// colour (a name among its numbers, a number out of range, a fourth number)
+// is not it, and a setter writes it anew.
+static bool IsMKColor(const CPDF_Array* color,
+                      unsigned int r,
+                      unsigned int g,
+                      unsigned int b) {
+  if (!color || color->size() != 3) {
+    return false;
+  }
+  auto is_component = [color](size_t index, unsigned int value) {
+    RetainPtr<const CPDF_Object> entry = color->GetDirectObjectAt(index);
+    if (!entry || !entry->IsNumber()) {
+      return false;
+    }
+    const float stored = entry->GetNumber();
+    return stored >= 0.f && stored <= 1.f &&
+           MKColorComponent(color, index) == value;
+  };
+  return is_component(0, r) && is_component(1, g) && is_component(2, b);
+}
+
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_SetMKColor(FPDF_ANNOTATION annot,
                                                          EPDF_MK_COLORTYPE type,
                                                          unsigned int R,
                                                          unsigned int G,
                                                          unsigned int B) {
   ScopedFPDFAnnotationView annot_view(annot);
-  RetainPtr<CPDF_Dictionary> pAnnotDict =
-      GetMutableAnnotDictFromFPDFAnnotation(annot);
-  if (!pAnnotDict || R > 255 || G > 255 || B > 255) {
+  const CPDF_Dictionary* annot_dict = GetAnnotDictFromFPDFAnnotation(annot);
+  if (!annot_dict || R > 255 || G > 255 || B > 255) {
     return false;
   }
 
-  RetainPtr<CPDF_Dictionary> pMK = pAnnotDict->GetOrCreateDictFor("MK");
-  ByteString key = GetMKColorKey(type);
-
-  RetainPtr<CPDF_Array> pColor = pMK->GetMutableArrayFor(key.AsStringView());
-  if (pColor) {
-    pColor->Clear();
-  } else {
-    pColor = pMK->SetNewFor<CPDF_Array>(key);
+  // Nothing to change: no write.
+  const ByteString key = GetMKColorKey(type);
+  RetainPtr<const CPDF_Dictionary> mk = annot_dict->GetDictFor("MK");
+  RetainPtr<const CPDF_Array> color =
+      mk ? mk->GetArrayFor(key.AsStringView()) : nullptr;
+  if (IsMKColor(color.Get(), R, G, B)) {
+    return true;
   }
 
+  RetainPtr<CPDF_Dictionary> pAnnotDict =
+      GetMutableAnnotDictFromFPDFAnnotation(annot);
+  if (!pAnnotDict) {
+    return false;
+  }
+
+  // A new array under the key. The one the entry named is not written into:
+  // it may be an object of its own, which another /MK names too.
+  RetainPtr<CPDF_Array> pColor =
+      OwnMKForWriting(annot, pAnnotDict.Get(), /*create=*/true)
+          ->SetNewFor<CPDF_Array>(key);
   pColor->AppendNew<CPDF_Number>(R / 255.f);
   pColor->AppendNew<CPDF_Number>(G / 255.f);
   pColor->AppendNew<CPDF_Number>(B / 255.f);
@@ -4425,9 +4686,9 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_GetMKColor(FPDF_ANNOTATION annot,
     return false;
   }
 
-  *R = static_cast<unsigned int>(pColor->GetFloatAt(0) * 255.f + 0.5f);
-  *G = static_cast<unsigned int>(pColor->GetFloatAt(1) * 255.f + 0.5f);
-  *B = static_cast<unsigned int>(pColor->GetFloatAt(2) * 255.f + 0.5f);
+  *R = MKColorComponent(pColor.Get(), 0);
+  *G = MKColorComponent(pColor.Get(), 1);
+  *B = MKColorComponent(pColor.Get(), 2);
 
   return true;
 }
@@ -4435,19 +4696,28 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_GetMKColor(FPDF_ANNOTATION annot,
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 EPDFAnnot_ClearMKColor(FPDF_ANNOTATION annot, EPDF_MK_COLORTYPE type) {
   ScopedFPDFAnnotationView annot_view(annot);
+  const CPDF_Dictionary* annot_dict = GetAnnotDictFromFPDFAnnotation(annot);
+  if (!annot_dict) {
+    return false;
+  }
+
+  // Nothing to remove: no write.
+  const ByteString key = GetMKColorKey(type);
+  RetainPtr<const CPDF_Dictionary> mk = annot_dict->GetDictFor("MK");
+  if (!mk || !mk->KeyExist(key.AsStringView())) {
+    return true;
+  }
+
   RetainPtr<CPDF_Dictionary> pAnnotDict =
       GetMutableAnnotDictFromFPDFAnnotation(annot);
   if (!pAnnotDict) {
     return false;
   }
-
-  RetainPtr<CPDF_Dictionary> pMK = pAnnotDict->GetMutableDictFor("MK");
-  if (!pMK) {
-    return true;
+  RetainPtr<CPDF_Dictionary> pMK =
+      OwnMKForWriting(annot, pAnnotDict.Get(), /*create=*/false);
+  if (pMK) {
+    pMK->RemoveFor(key.AsStringView());
   }
-
-  ByteString key = GetMKColorKey(type);
-  pMK->RemoveFor(key.AsStringView());
 
   return true;
 }
@@ -4488,11 +4758,17 @@ FPDF_BOOL SetMKNumber(FPDF_ANNOTATION annot,
   if (FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_WIDGET) {
     return false;
   }
+  // The entry is that number already when it is an integer equal to it. One
+  // that only reads as it (a real that is cut down to it) is written anew.
   RetainPtr<const CPDF_Dictionary> mk = WidgetMKFromFPDFAnnotation(annot);
   const bool present = mk && mk->KeyExist(key);
+  RetainPtr<const CPDF_Object> stored =
+      present ? mk->GetDirectObjectFor(key) : nullptr;
+  const CPDF_Number* number = stored ? stored->AsNumber() : nullptr;
   const bool unchanged = value == absent_value
                              ? !present
-                             : present && mk->GetIntegerFor(key) == value;
+                             : number && number->IsInteger() &&
+                                   number->GetInteger() == value;
   if (unchanged) {
     return true;
   }
@@ -4502,9 +4778,10 @@ FPDF_BOOL SetMKNumber(FPDF_ANNOTATION annot,
     return false;
   }
   if (value != absent_value) {
-    dict->GetOrCreateDictFor("MK")->SetNewFor<CPDF_Number>(key, value);
+    OwnMKForWriting(annot, dict.Get(), /*create=*/true)
+        ->SetNewFor<CPDF_Number>(key, value);
   } else if (RetainPtr<CPDF_Dictionary> mutable_mk =
-                 dict->GetMutableDictFor("MK")) {
+                 OwnMKForWriting(annot, dict.Get(), /*create=*/false)) {
     mutable_mk->RemoveFor(key);
   }
   return true;
@@ -4524,10 +4801,16 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_SetMKText(FPDF_ANNOTATION annot,
   if (text) {
     next = UNSAFE_BUFFERS(WideStringFromFPDFWideString(text));
   }
-  // Nothing to change: no write.
+  // Nothing to change: no write. The entry is that text already when it is a
+  // string that reads as it. One that only reads as it (a name) is written
+  // anew.
   RetainPtr<const CPDF_Dictionary> mk = WidgetMKFromFPDFAnnotation(annot);
   const bool present = mk && mk->KeyExist(key);
-  if (next ? present && mk->GetUnicodeTextFor(key) == *next : !present) {
+  RetainPtr<const CPDF_Object> stored =
+      present ? mk->GetDirectObjectFor(key) : nullptr;
+  const bool is_that_text = next && stored && stored->IsString() &&
+                            stored->GetUnicodeText() == *next;
+  if (next ? is_that_text : !present) {
     return true;
   }
   RetainPtr<CPDF_Dictionary> dict =
@@ -4536,10 +4819,10 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_SetMKText(FPDF_ANNOTATION annot,
     return false;
   }
   if (next) {
-    dict->GetOrCreateDictFor("MK")->SetNewFor<CPDF_String>(
-        key, next->AsStringView());
+    OwnMKForWriting(annot, dict.Get(), /*create=*/true)
+        ->SetNewFor<CPDF_String>(key, next->AsStringView());
   } else if (RetainPtr<CPDF_Dictionary> mutable_mk =
-                 dict->GetMutableDictFor("MK")) {
+                 OwnMKForWriting(annot, dict.Get(), /*create=*/false)) {
     mutable_mk->RemoveFor(key);
   }
   return true;
@@ -4580,6 +4863,102 @@ EPDFAnnot_GetMKTextPosition(FPDF_ANNOTATION annot) {
   }
   RetainPtr<const CPDF_Dictionary> mk = WidgetMKFromFPDFAnnotation(annot);
   return mk ? mk->GetIntegerFor("TP") : 0;
+}
+
+namespace {
+
+// The /MK key of icon |which| (EPDF_MK_ICON_*), or null.
+const char* MKIconKey(int which) {
+  switch (which) {
+    case EPDF_MK_ICON_I:
+      return pdfium::appearance::kI;
+    case EPDF_MK_ICON_RI:
+      return pdfium::appearance::kRI;
+    case EPDF_MK_ICON_IX:
+      return pdfium::appearance::kIX;
+    default:
+      return nullptr;
+  }
+}
+
+}  // namespace
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_SetMKIcon(FPDF_ANNOTATION annot,
+                                                        int which,
+                                                        unsigned int drawing) {
+  ScopedFPDFAnnotationView annot_view(annot);
+  const char* key = MKIconKey(which);
+  CPDF_AnnotContext* ctx = CPDFAnnotContextFromFPDFAnnotation(annot);
+  if (!key || !ctx || drawing == 0 ||
+      FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_WIDGET) {
+    return false;
+  }
+  CPDF_Document* doc = ctx->GetPage() ? ctx->GetPage()->GetDocument() : nullptr;
+  if (!doc) {
+    return false;
+  }
+  // The drawing is only read: it can be one other widgets and stamps place,
+  // or one an earlier revision holds.
+  RetainPtr<const CPDF_Stream> form =
+      ToStream(doc->GetOrParseIndirectObject(drawing));
+  if (!form || form->GetDict()->GetNameFor("Subtype") != "Form") {
+    return false;
+  }
+  // Nothing to change: no write.
+  RetainPtr<const CPDF_Dictionary> mk = WidgetMKFromFPDFAnnotation(annot);
+  RetainPtr<const CPDF_Stream> named = mk ? mk->GetStreamFor(key) : nullptr;
+  if (named && named->GetObjNum() == drawing) {
+    return true;
+  }
+  RetainPtr<CPDF_Dictionary> annot_dict = ctx->GetMutableAnnotDict();
+  if (!annot_dict) {
+    return false;
+  }
+  OwnMKForWriting(annot, annot_dict.Get(), /*create=*/true)
+      ->SetNewFor<CPDF_Reference>(key, doc, drawing);
+  return true;
+}
+
+FPDF_EXPORT unsigned int FPDF_CALLCONV
+EPDFAnnot_GetMKIcon(FPDF_ANNOTATION annot, int which) {
+  ScopedFPDFAnnotationView annot_view(annot);
+  const char* key = MKIconKey(which);
+  RetainPtr<const CPDF_Dictionary> mk =
+      key ? WidgetMKFromFPDFAnnotation(annot) : nullptr;
+  RetainPtr<const CPDF_Stream> icon = key ? MKIconForm(mk.Get(), key) : nullptr;
+  return icon ? icon->GetObjNum() : 0;
+}
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_ClearMKIcon(FPDF_ANNOTATION annot,
+                                                          int which) {
+  ScopedFPDFAnnotationView annot_view(annot);
+  const char* key = MKIconKey(which);
+  if (!key || FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_WIDGET) {
+    return false;
+  }
+  // Nothing to remove: no write.
+  RetainPtr<const CPDF_Dictionary> mk = WidgetMKFromFPDFAnnotation(annot);
+  if (!mk || !mk->KeyExist(key)) {
+    return true;
+  }
+  RetainPtr<CPDF_Dictionary> dict =
+      GetMutableAnnotDictFromFPDFAnnotation(annot);
+  RetainPtr<CPDF_Dictionary> mutable_mk =
+      dict ? OwnMKForWriting(annot, dict.Get(), /*create=*/false) : nullptr;
+  if (!mutable_mk) {
+    return false;
+  }
+  mutable_mk->RemoveFor(key);
+  return true;
+}
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_HasMKIcon(FPDF_ANNOTATION annot,
+                                                        int which) {
+  ScopedFPDFAnnotationView annot_view(annot);
+  const char* key = MKIconKey(which);
+  RetainPtr<const CPDF_Dictionary> mk =
+      key ? WidgetMKFromFPDFAnnotation(annot) : nullptr;
+  return key && !!MKIconForm(mk.Get(), key);
 }
 
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
